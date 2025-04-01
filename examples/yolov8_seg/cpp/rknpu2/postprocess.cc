@@ -521,9 +521,9 @@ void seg_reverse(uint8_t *seg_mask, uint8_t *cropped_seg, uint8_t *seg_mask_real
     }
     // Note: Here are different methods provided for implementing single-channel image scaling.
     //       The method of using rga to resize the image requires that the image size is 2 aligned.
-    resize_by_opencv_uint8(cropped_seg, cropped_width, cropped_height, 1, seg_mask_real, ori_in_width, ori_in_height);
+    //resize_by_opencv_uint8(cropped_seg, cropped_width, cropped_height, 1, seg_mask_real, ori_in_width, ori_in_height);
     // resize_by_rga_rk356x(cropped_seg, cropped_width, cropped_height, seg_mask_real, ori_in_width, ori_in_height);
-    // resize_by_rga_rk3588(cropped_seg, cropped_width, cropped_height, seg_mask_real, ori_in_width, ori_in_height);
+    resize_by_rga_rk3588(cropped_seg, cropped_width, cropped_height, seg_mask_real, ori_in_width, ori_in_height);
 }
 
 static int box_reverse(int position, int boundary, int pad, float scale)
@@ -911,8 +911,8 @@ int post_process(rknn_app_context_t *app_ctx, rknn_output *outputs, letterbox_t 
     int COLS_A = PROTO_CHANNEL;
     int COLS_B = PROTO_HEIGHT * PROTO_WEIGHT;
     float *matmul_out = (float *)malloc(boxes_num * PROTO_HEIGHT * PROTO_WEIGHT * sizeof(float));
-    matmul_by_cpu_fp(filterSegments_by_nms, proto, matmul_out, ROWS_A, COLS_A, COLS_B);
-    // matmul_by_npu_fp(filterSegments_by_nms, proto, matmul_out, ROWS_A, COLS_A, COLS_B, app_ctx);
+    //matmul_by_cpu_fp(filterSegments_by_nms, proto, matmul_out, ROWS_A, COLS_A, COLS_B);
+    matmul_by_npu_fp(filterSegments_by_nms, proto, matmul_out, ROWS_A, COLS_A, COLS_B, app_ctx);
     timer.tok();
     timer.print_time("matmul_by_cpu_fp");
 
@@ -920,6 +920,7 @@ int post_process(rknn_app_context_t *app_ctx, rknn_output *outputs, letterbox_t 
     // resize to (boxes_num, model_in_width, model_in_height)
     float *seg_mask = (float *)malloc(boxes_num * model_in_height * model_in_width * sizeof(float));
     resize_by_opencv_fp(matmul_out, PROTO_WEIGHT, PROTO_HEIGHT, boxes_num, seg_mask, model_in_width, model_in_height);
+    //resize_by_rga_rk3588(matmul_out, PROTO_WEIGHT, PROTO_HEIGHT, boxes_num, seg_mask, model_in_width, model_in_height);
     timer.tok();
     timer.print_time("resize_by_opencv_fp");
 
@@ -945,6 +946,8 @@ int post_process(rknn_app_context_t *app_ctx, rknn_output *outputs, letterbox_t 
     timer.tik();
     uint8_t *seg_mask = (uint8_t *)malloc(boxes_num * model_in_height * model_in_width * sizeof(uint8_t));
     resize_by_opencv_uint8(matmul_out, PROTO_WEIGHT, PROTO_HEIGHT, boxes_num, seg_mask, model_in_width, model_in_height);
+    //resize_by_rga_rk3588(matmul_out, PROTO_WEIGHT, PROTO_HEIGHT, boxes_num, seg_mask, model_in_width, model_in_height);
+    
     timer.tok();
     timer.print_time("resize_by_opencv_uint8");
 
@@ -1018,3 +1021,4 @@ void deinit_post_process()
         }
     }
 }
+

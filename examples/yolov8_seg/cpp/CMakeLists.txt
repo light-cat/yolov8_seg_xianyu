@@ -20,18 +20,24 @@ else()
 message(STATUS "32bit")
 set (TARGET_LIB_ARCH lib)
 endif()
-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
-  set(OpenCV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/opencv/opencv-android-sdk-build/sdk/native/jni/abi-${CMAKE_ANDROID_ARCH_ABI})
-else()
-    if(TARGET_LIB_ARCH STREQUAL "lib")
-      set(OpenCV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/opencv/opencv-linux-armhf/share/OpenCV)
-    else()
-      set(OpenCV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/opencv/opencv-linux-aarch64/share/OpenCV)
-    endif()
-endif()
-find_package(OpenCV REQUIRED)
-message(STATUS OpenCV_DIR=${OpenCV_DIR})
-message(STATUS OpenCV_LIBS=${OpenCV_LIBS})
+
+#if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+#  set(OpenCV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/opencv/opencv-android-sdk-build/sdk/native/jni/abi-${CMAKE_ANDROID_ARCH_ABI})
+#else()
+#    if(TARGET_LIB_ARCH STREQUAL "lib")
+#      set(OpenCV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/opencv/opencv-linux-armhf/share/OpenCV)
+#    else()
+#      set(OpenCV_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/opencv/opencv-linux-aarch64/share/OpenCV)
+#    endif()
+#endif()
+#find_package(OpenCV REQUIRED)
+#message(STATUS OpenCV_DIR=${OpenCV_DIR})
+#message(STATUS OpenCV_LIBS=${OpenCV_LIBS})
+
+set(OpenCV_DIR /opt/opencv-4.5.5/opencv_arm64/lib/cmake/opencv4)  # 填入OpenCVConfig.cmake
+find_package(OpenCV 4 REQUIRED)
+include_directories(${OpenCV_INCLUDE_DIRS})
+message(STATUS OpenCV_LIBS=${OpenCV_INCLUDE_DIRS})
 
 set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
 
@@ -71,7 +77,7 @@ else()
       fileutils
       imageutils
       imagedrawing
-      ${OpenCV_LIBS}    
+      ${OpenCV_LIBS} 
       ${LIBRKNNRT}
   )
 endif()
@@ -85,7 +91,7 @@ endif()
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(THREADS_PREFER_PTHREAD_FLAG ON)
     find_package(Threads REQUIRED)
-    target_link_libraries(${PROJECT_NAME} Threads::Threads)
+    target_link_libraries(${PROJECT_NAME} Threads::Threads dl)
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
