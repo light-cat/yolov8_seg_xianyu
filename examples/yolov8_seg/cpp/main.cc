@@ -21,8 +21,31 @@
 
 // 全局模型上下文
 static rknn_app_context_t rknn_app_ctx[2];  // 为两个NPU核心准备两个上下文
-static std::mutex model_mutex[2];          // 保护每个模型的互斥锁
-static bool models_initialized = false;    // 标记模型是否已初始化
+static bool models_initialized = false;     // 标记模型是否已初始化
+
+// 定义类别颜色表，与示例一致
+static unsigned char class_colors[][3] = {
+    {255, 56, 56},   // 'FF3838'
+    {255, 157, 151}, // 'FF9D97'
+    {255, 112, 31},  // 'FF701F'
+    {255, 178, 29},  // 'FFB21D'
+    {207, 210, 49},  // 'CFD231'
+    {72, 249, 10},   // '48F90A'
+    {146, 204, 23},  // '92CC17'
+    {61, 219, 134},  // '3DDB86'
+    {26, 147, 52},   // '1A9334'
+    {0, 212, 187},   // '00D4BB'
+    {44, 153, 168},  // '2C99A8'
+    {0, 194, 255},   // '00C2FF'
+    {52, 69, 147},   // '344593'
+    {100, 115, 255}, // '6473FF'
+    {0, 24, 236},    // '0018EC'
+    {132, 56, 255},  // '8438FF'
+    {82, 0, 133},    // '520085'
+    {203, 56, 255},  // 'CB38FF'
+    {255, 149, 200}, // 'FF95C8'
+    {255, 55, 199}   // 'FF37C7'
+};
 
 struct FrameData {
     cv::Mat frame;
@@ -79,8 +102,8 @@ void setThreadAffinity(std::thread& t, int core_id) {
 }
 
 std::atomic<bool> running{true};
-ThreadSafeQueue<FrameData> input_queue;
-ThreadSafeQueue<FrameData> output_queue;
+ThreadSafeQueue<FrameData> input_queue;  // 线程安全的输入队列
+ThreadSafeQueue<FrameData> output_queue; // 线程安全的输出队列
 std::atomic<int> frame_counter{0};
 
 // 初始化模型的函数，只在程序启动时调用一次
@@ -126,6 +149,13 @@ static void cleanup_models() {
 }
 
 void videoCaptureThread(const std::string& source) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(0, &mask);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
+        printf("Set thread affinity failed for capture thread\n");
+    printf("Bind capture thread on CPU 0\n");
+
     cv::VideoCapture cap;
     if (source.empty() || source == "0") {
         cap.open(0);
@@ -152,23 +182,18 @@ void videoCaptureThread(const std::string& source) {
         int current_index = frame_counter++;
         input_queue.push(FrameData(frame, current_index));
     }
-    input_queue.push(FrameData());
+    input_queue.push(FrameData()); // 发送结束信号
     cap.release();
 }
-
-
 
 void detectionThread(int npu_core, int thread_id, int cpu_id) {
     int ctx_idx = npu_core;  // 每个线程使用对应的模型上下文
     cpu_set_t mask;
-
-	CPU_ZERO(&mask);
-	CPU_SET(cpu_id, &mask);
-
-	if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
-		printf("set thread affinity failed\n");
-
-	printf("Bind NPU process on CPU %d\n", cpu_id);
+    CPU_ZERO(&mask);
+    CPU_SET(cpu_id, &mask);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
+        printf("Set thread affinity failed\n");
+    printf("Bind NPU process %d on CPU %d\n", thread_id, cpu_id);
 
     if (!models_initialized) {
         printf("Thread %d: Models not initialized, exiting.\n", thread_id);
@@ -190,21 +215,19 @@ void detectionThread(int npu_core, int thread_id, int cpu_id) {
         img.size = img.width * img.height * 3;
         img.virt_addr = frame_data.frame.data;
 
-        {
-            std::lock_guard<std::mutex> lock(model_mutex[ctx_idx]);
-            auto start = std::chrono::steady_clock::now();
-            object_detect_result_list od_results;
-            if (inference_yolov8_seg_model(&rknn_app_ctx[ctx_idx], &img, &od_results) == 0) {
-                auto end = std::chrono::steady_clock::now();
-                double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-                printf("Thread %d (NPU Core %d): Detected %d objects in %.2f ms for frame %d\n", 
-                       thread_id, npu_core, od_results.count, time_ms, frame_data.frame_index);
-                frame_data.od_results = od_results;
-            } else {
-                printf("Thread %d (NPU Core %d): Inference failed for frame %d\n", 
-                       thread_id, npu_core, frame_data.frame_index);
-                frame_data.od_results.count = 0;
-            }
+        // 无需锁，因为每个线程使用独立的模型上下文
+        auto start = std::chrono::steady_clock::now();
+        object_detect_result_list od_results;
+        if (inference_yolov8_seg_model(&rknn_app_ctx[ctx_idx], &img, &od_results) == 0) {
+            auto end = std::chrono::steady_clock::now();
+            double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            printf("Thread %d (NPU Core %d): Detected %d objects in %.2f ms for frame %d\n", 
+                   thread_id, npu_core, od_results.count, time_ms, frame_data.frame_index);
+            frame_data.od_results = od_results;
+        } else {
+            printf("Thread %d (NPU Core %d): Inference failed for frame %d\n", 
+                   thread_id, npu_core, frame_data.frame_index);
+            frame_data.od_results.count = 0;
         }
 
         output_queue.push(frame_data);
@@ -212,6 +235,13 @@ void detectionThread(int npu_core, int thread_id, int cpu_id) {
 }
 
 void saveThread(const std::string& video_source) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(1, &mask);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
+        printf("Set thread affinity failed for save thread\n");
+    printf("Bind save thread on CPU 1\n");
+
     cv::VideoCapture cap(video_source.empty() || video_source == "0" ? 0 : video_source);
     if (!cap.isOpened()) {
         printf("Error: Could not open video source for properties\n");
@@ -259,6 +289,25 @@ void saveThread(const std::string& video_source) {
             FrameData& ordered_frame = frame_buffer[expected_index];
             cv::Mat& frame = ordered_frame.frame;
 
+            // 绘制掩码
+            if (ordered_frame.od_results.count >= 1 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
+                uint8_t* seg_mask = ordered_frame.od_results.results_seg[0].seg_mask;
+                float alpha = 0.5f; // 透明度
+                for (int j = 0; j < height; j++) {
+                    for (int k = 0; k < width; k++) {
+                        int idx = j * width + k;
+                        if (seg_mask[idx] != 0) {
+                            int cls_idx = seg_mask[idx] % 20; // 假设 20 是 class_colors 的大小
+                            uchar* pixel = frame.ptr<uchar>(j, k);
+                            pixel[2] = (uchar)(class_colors[cls_idx][0] * (1 - alpha) + pixel[2] * alpha); // R
+                            pixel[1] = (uchar)(class_colors[cls_idx][1] * (1 - alpha) + pixel[1] * alpha); // G
+                            pixel[0] = (uchar)(class_colors[cls_idx][2] * (1 - alpha) + pixel[0] * alpha); // B
+                        }
+                    }
+                }
+            }
+
+            // 绘制边界框和标签
             for (int i = 0; i < ordered_frame.od_results.count; i++) {
                 object_detect_result* det_result = &ordered_frame.od_results.results[i];
                 int x1 = det_result->box.left;
@@ -275,6 +324,13 @@ void saveThread(const std::string& video_source) {
 
             writer.write(frame);
             frame_count++;
+
+            // 释放掩码内存
+            if (ordered_frame.od_results.count > 0 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
+                free(ordered_frame.od_results.results_seg[0].seg_mask);
+                ordered_frame.od_results.results_seg[0].seg_mask = nullptr;
+            }
+
             frame_buffer.erase(expected_index);
             expected_index++;
         }
@@ -311,21 +367,40 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    // 创建并分离线程
     std::thread capture_thread(videoCaptureThread, std::string(video_source));
     setThreadAffinity(capture_thread, 0);
+    capture_thread.detach();
 
     std::thread detect_thread1(detectionThread, 0, 1, 4);
+    setThreadAffinity(detect_thread1, 4);
+    detect_thread1.detach();
+
     std::thread detect_thread2(detectionThread, 1, 2, 5);
+    setThreadAffinity(detect_thread2, 5);
+    detect_thread2.detach();
 
     std::thread save_thread(saveThread, std::string(video_source));
     setThreadAffinity(save_thread, 1);
+    save_thread.detach();
 
-    capture_thread.join();
-    detect_thread1.join();
-    detect_thread2.join();
-    save_thread.join();
+    // 主线程等待用户输入以退出
+    printf("Press 'q' and Enter to quit...\n");
+    char input;
+    while (true) {
+        input = getchar();
+        if (input == 'q' || input == 'Q') {
+            running = false;
+            break;
+        }
+    }
 
-    // 程序结束时清理模型
+    // 等待队列清空，确保所有帧处理完成
+    while (!input_queue.empty() || !output_queue.empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // 清理资源
     cleanup_models();
     deinit_post_process();
     printf("Processing completed.\n");
