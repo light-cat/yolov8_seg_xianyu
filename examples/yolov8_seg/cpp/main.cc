@@ -9,6 +9,10 @@
 #include <condition_variable>
 #include <map>
 #include <sched.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -18,6 +22,13 @@
 #include "file_utils.h"
 #include "image_drawing.h"
 #include "rknn_api.h"
+
+// 添加宏定义控制TCP发送线程
+#define ENABLE_TCP_SENDER 1  // 1:启用 0:禁用
+
+// TCP相关配置
+#define TCP_PORT 12345
+#define TCP_SERVER_IP "192.168.0.140"  // 修改为上位机IP
 
 // 全局模型上下文
 static rknn_app_context_t rknn_app_ctx[2];  // 为两个NPU核心准备两个上下文
@@ -104,6 +115,7 @@ void setThreadAffinity(std::thread& t, int core_id) {
 std::atomic<bool> running{true};
 ThreadSafeQueue<FrameData> input_queue;  // 线程安全的输入队列
 ThreadSafeQueue<FrameData> output_queue; // 线程安全的输出队列
+ThreadSafeQueue<FrameData> processed_queue; // 新增队列，用于保存处理后的帧
 std::atomic<int> frame_counter{0};
 
 // 初始化模型的函数，只在程序启动时调用一次
@@ -158,13 +170,16 @@ void videoCaptureThread(const std::string& source) {
 
     cv::VideoCapture cap;
     if (source.empty() || source == "0") {
-        cap.open(0);
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, 1920);
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
-        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+        cap.open(0, cv::CAP_V4L2);  // 使用V4L2后端
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, 1280);  // 降低分辨率
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
+        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y', 'U', 'Y', 'V'));  // 使用YUYV格式
         cap.set(cv::CAP_PROP_FPS, 30);
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);  // 减少缓冲区大小
+        cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 3);  // 自动曝光
     } else {
         cap.open(source);
+        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);  // 对于文件也减少缓冲
     }
 
     if (!cap.isOpened()) {
@@ -173,14 +188,27 @@ void videoCaptureThread(const std::string& source) {
         return;
     }
 
+    // 打印实际设置
+    printf("Actual FPS: %.2f, Width: %.0f, Height: %.0f, FourCC: %d\n",
+           cap.get(cv::CAP_PROP_FPS),
+           cap.get(cv::CAP_PROP_FRAME_WIDTH),
+           cap.get(cv::CAP_PROP_FRAME_HEIGHT),
+           (int)cap.get(cv::CAP_PROP_FOURCC));
+
     cv::Mat frame;
     while (running) {
+        auto start = std::chrono::steady_clock::now();
         if (!cap.read(frame) || frame.empty()) {
             printf("Warning: Failed to read frame\n");
             break;
         }
+        auto end = std::chrono::steady_clock::now();
+        double read_time = std::chrono::duration<double, std::milli>(end - start).count();
+        
         int current_index = frame_counter++;
         input_queue.push(FrameData(frame, current_index));
+        
+        printf("Frame %d read time: %.2f ms\n", current_index, read_time);
     }
     input_queue.push(FrameData()); // 发送结束信号
     cap.release();
@@ -215,7 +243,6 @@ void detectionThread(int npu_core, int thread_id, int cpu_id) {
         img.size = img.width * img.height * 3;
         img.virt_addr = frame_data.frame.data;
 
-        // 无需锁，因为每个线程使用独立的模型上下文
         auto start = std::chrono::steady_clock::now();
         object_detect_result_list od_results;
         if (inference_yolov8_seg_model(&rknn_app_ctx[ctx_idx], &img, &od_results) == 0) {
@@ -297,7 +324,7 @@ void saveThread(const std::string& video_source) {
                     for (int k = 0; k < width; k++) {
                         int idx = j * width + k;
                         if (seg_mask[idx] != 0) {
-                            int cls_idx = seg_mask[idx] % 20; // 假设 20 是 class_colors 的大小
+                            int cls_idx = seg_mask[idx] % 20;
                             uchar* pixel = frame.ptr<uchar>(j, k);
                             pixel[2] = (uchar)(class_colors[cls_idx][0] * (1 - alpha) + pixel[2] * alpha); // R
                             pixel[1] = (uchar)(class_colors[cls_idx][1] * (1 - alpha) + pixel[1] * alpha); // G
@@ -322,8 +349,12 @@ void saveThread(const std::string& video_source) {
                 cv::putText(frame, text, cv::Point(x1, y1 - 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
             }
 
+            // 保存视频
             writer.write(frame);
             frame_count++;
+
+            // 将处理后的帧推送到processed_queue供TCP发送
+            processed_queue.push(FrameData(frame, ordered_frame.frame_index, ordered_frame.od_results));
 
             // 释放掩码内存
             if (ordered_frame.od_results.count > 0 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
@@ -344,6 +375,66 @@ void saveThread(const std::string& video_source) {
     printf("Video saved as '%s' with %d frames\n", filename, frame_count);
 }
 
+#if ENABLE_TCP_SENDER
+void tcpSenderThread() {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(2, &mask);  // 绑定到CPU核心2
+    if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
+        printf("Set thread affinity failed for TCP sender thread\n");
+    printf("Bind TCP sender thread on CPU 2\n");
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        printf("TCP socket creation failed\n");
+        return;
+    }
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(TCP_PORT);
+    inet_pton(AF_INET, TCP_SERVER_IP, &server_addr.sin_addr);
+
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        printf("TCP connection failed\n");
+        close(sock);
+        return;
+    }
+
+    while (running) {
+        FrameData frame_data;
+        if (!processed_queue.pop(frame_data) || !frame_data.is_valid) {
+            break;
+        }
+
+        // 编码图像为JPEG
+        std::vector<uchar> buffer;
+        cv::imencode(".jpg", frame_data.frame, buffer);
+        
+        // 发送数据大小
+        uint32_t size = buffer.size();
+        size = htonl(size);
+        if (send(sock, &size, sizeof(size), 0) < 0) {
+            printf("Failed to send image size\n");
+            break;
+        }
+
+        // 发送图像数据
+        if (send(sock, buffer.data(), buffer.size(), 0) < 0) {
+            printf("Failed to send image data\n");
+            break;
+        }
+
+        printf("Sent processed frame %d to TCP server, size: %u bytes\n", 
+               frame_data.frame_index, (unsigned int)buffer.size());
+    }
+
+    close(sock);
+    printf("TCP sender thread terminated\n");
+}
+#endif
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         printf("%s <model_path> <video_path_or_camera_index>\n", argv[0]);
@@ -354,7 +445,6 @@ int main(int argc, char **argv) {
     const char *model_path = argv[1];
     const char *video_source = argv[2];
 
-    // 一次性初始化两个模型
     if (initialize_models(model_path) != 0) {
         printf("Failed to initialize models, exiting.\n");
         return -1;
@@ -367,7 +457,6 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    // 创建并分离线程
     std::thread capture_thread(videoCaptureThread, std::string(video_source));
     setThreadAffinity(capture_thread, 0);
     capture_thread.detach();
@@ -384,7 +473,12 @@ int main(int argc, char **argv) {
     setThreadAffinity(save_thread, 1);
     save_thread.detach();
 
-    // 主线程等待用户输入以退出
+#if ENABLE_TCP_SENDER
+    std::thread tcp_thread(tcpSenderThread);
+    setThreadAffinity(tcp_thread, 2);
+    tcp_thread.detach();
+#endif
+
     printf("Press 'q' and Enter to quit...\n");
     char input;
     while (true) {
@@ -395,12 +489,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    // 等待队列清空，确保所有帧处理完成
-    while (!input_queue.empty() || !output_queue.empty()) {
+    while (!input_queue.empty() || !output_queue.empty() || !processed_queue.empty()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // 清理资源
     cleanup_models();
     deinit_post_process();
     printf("Processing completed.\n");
