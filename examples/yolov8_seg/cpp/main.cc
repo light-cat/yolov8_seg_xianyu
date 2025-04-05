@@ -32,11 +32,108 @@ extern "C"
 }
 
 // 添加宏定义控制TCP发送线程
-#define ENABLE_TCP_SENDER 0 // 1:启用 0:禁用
+#define ENABLE_TCP_SENDER 1 // 1:启用 0:禁用
+#define CUBICSPLINE 0
+#define GAUSSIANBLUR 1
 
+#if CUBICSPLINE
+// 简单的三次样条插值实现
+class CubicSpline {
+    public:
+        CubicSpline(const std::vector<float>& x, const std::vector<float>& y) {
+            int n = x.size();
+            if (n < 2) return;
+    
+            std::vector<float> h(n - 1), alpha(n - 1);
+            std::vector<float> l(n), mu(n), z(n);
+            a = y;
+            b.resize(n - 1);
+            c.resize(n);
+            d.resize(n - 1);
+    
+            // 计算间隔 h
+            for (int i = 0; i < n - 1; i++) {
+                h[i] = x[i + 1] - x[i];
+            }
+    
+            // 计算 alpha
+            for (int i = 1; i < n - 1; i++) {
+                alpha[i] = 3 * (a[i + 1] - a[i]) / h[i] - 3 * (a[i] - a[i - 1]) / h[i - 1];
+            }
+    
+            // 追赶法求解三对角方程组
+            l[0] = 1.0f;
+            mu[0] = 0.0f;
+            z[0] = 0.0f;
+            for (int i = 1; i < n - 1; i++) {
+                l[i] = 2 * (x[i + 1] - x[i - 1]) - h[i - 1] * mu[i - 1];
+                mu[i] = h[i] / l[i];
+                z[i] = (alpha[i] - h[i - 1] * z[i - 1]) / l[i];
+            }
+            l[n - 1] = 1.0f;
+            z[n - 1] = 0.0f;
+            c[n - 1] = 0.0f;
+    
+            // 回代求解
+            for (int j = n - 2; j >= 0; j--) {
+                c[j] = z[j] - mu[j] * c[j + 1];
+                b[j] = (a[j + 1] - a[j]) / h[j] - h[j] * (c[j + 1] + 2 * c[j]) / 3;
+                d[j] = (c[j + 1] - c[j]) / (3 * h[j]);
+            }
+        }
+    
+        float evaluate(float x, const std::vector<float>& x_vals) {
+            int n = x_vals.size();
+            if (n < 2) return 0.0f;
+    
+            // 找到 x 所在的区间
+            int i = 0;
+            for (i = 0; i < n - 1; i++) {
+                if (x <= x_vals[i + 1]) break;
+            }
+            if (i >= n - 1) i = n - 2;
+    
+            float t = x - x_vals[i];
+            return a[i] + b[i] * t + c[i] * t * t + d[i] * t * t * t;
+        }
+    
+    private:
+        std::vector<float> a, b, c, d;
+    };
+    
+    // 插值生成均匀分布的轨迹点
+    void interpolate_track(std::vector<cv::Point>& track, int target_size) {
+        if (track.size() < 2) return;
+    
+        // 提取 x 和 y 坐标
+        std::vector<float> x_coords(track.size()), y_coords(track.size()), t_vals(track.size());
+        for (size_t i = 0; i < track.size(); i++) {
+            x_coords[i] = static_cast<float>(track[i].x);
+            y_coords[i] = static_cast<float>(track[i].y);
+            t_vals[i] = static_cast<float>(i);
+        }
+    
+        // 使用样条插值
+        CubicSpline spline_x(t_vals, x_coords);
+        CubicSpline spline_y(t_vals, y_coords);
+    
+        // 生成均匀分布的点
+        std::vector<cv::Point> new_track;
+        float step = static_cast<float>(track.size() - 1) / (target_size - 1);
+        for (int i = 0; i < target_size; i++) {
+            float t = i * step;
+            int x = static_cast<int>(spline_x.evaluate(t, t_vals));
+            int y = static_cast<int>(spline_y.evaluate(t, t_vals));
+            new_track.emplace_back(x, y);
+        }
+    
+        track = new_track;
+    }
+
+#endif
 // TCP相关配置
 #define TCP_PORT 12345
-#define TCP_SERVER_IP "192.168.0.140"  // 修改为上位机IP
+#define TCP_SERVER_IP "192.168.0.145"  // 修改为上位机IP
 
 // 全局模型上下文
 static rknn_app_context_t rknn_app_ctx[3];  // 为两个NPU核心准备两个上下文
@@ -130,6 +227,18 @@ ThreadSafeQueue<FrameData> input_queue;  // 线程安全的输入队列
 ThreadSafeQueue<FrameData> output_queue; // 线程安全的输出队列
 ThreadSafeQueue<FrameData> processed_queue; // 新增队列，用于保存处理后的帧
 std::atomic<int> frame_counter{0};
+
+
+#if GAUSSIANBLUR || CUBICSPLINE
+#include <deque>
+
+// 全局缓存，用于存储历史轨迹线（帧间平滑）
+std::deque<std::vector<cv::Point>> left_track_history;
+std::deque<std::vector<cv::Point>> right_track_history;
+std::deque<std::vector<cv::Point>> middle_track_history;
+const int HISTORY_SIZE = 5; // 滑动窗口大小（历史帧数）
+const float ALPHA = 0.3f;   // 当前帧权重（1 - ALPHA 为历史帧权重）
+#endif
 
 // 初始化模型的函数，只在程序启动时调用一次
 static int initialize_models(const char* model_path) {
@@ -514,6 +623,8 @@ void detectionThread(int npu_core, int thread_id, int cpu_id) {
     }
 }
 
+
+#if 0
 void saveThread(const std::string& video_source) {
     cpu_set_t mask;
     CPU_ZERO(&mask);
@@ -569,14 +680,16 @@ void saveThread(const std::string& video_source) {
             FrameData& ordered_frame = frame_buffer[expected_index];
             cv::Mat& frame = ordered_frame.frame;
 
-            // 绘制掩码
+            // 绘制掩码和轨迹线
             if (ordered_frame.od_results.count >= 1 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
                 uint8_t* seg_mask = ordered_frame.od_results.results_seg[0].seg_mask;
                 float alpha = 0.5f; // 透明度
+                int mask_pixel_count = 0;
                 for (int j = 0; j < height; j++) {
                     for (int k = 0; k < width; k++) {
                         int idx = j * width + k;
                         if (seg_mask[idx] != 0) {
+                            mask_pixel_count++;
                             int cls_idx = seg_mask[idx] % 20;
                             uchar* pixel = frame.ptr<uchar>(j, k);
                             pixel[2] = (uchar)(class_colors[cls_idx][0] * (1 - alpha) + pixel[2] * alpha); // R
@@ -585,6 +698,69 @@ void saveThread(const std::string& video_source) {
                         }
                     }
                 }
+                printf("Frame %d: Mask pixel count: %d\n", ordered_frame.frame_index, mask_pixel_count);
+
+                // 如果掩码像素数量足够，尝试绘制轨迹线
+                if (mask_pixel_count >= 100) {
+                    // 逐行扫描掩码，提取左右轨迹线
+                    std::vector<cv::Point> left_track, right_track, middle_track;
+                    for (int y = 0; y < height; y++) {
+                        int left_x = -1, right_x = -1;
+                        for (int x = 0; x < width; x++) {
+                            int idx = y * width + x;
+                            if (seg_mask[idx] != 0) {
+                                if (left_x == -1) left_x = x; // 左侧边界
+                                right_x = x; // 右侧边界
+                            }
+                        }
+                        if (left_x != -1 && right_x != -1) {
+                            left_track.emplace_back(left_x, y);
+                            right_track.emplace_back(right_x, y);
+                            middle_track.emplace_back((left_x + right_x) / 2, y);
+                        }
+                    }
+
+                    printf("Frame %d: Left track: %zu, Right track: %zu, Middle track: %zu\n",
+                           ordered_frame.frame_index, left_track.size(), right_track.size(), middle_track.size());
+
+                    // 如果轨迹点足够，平滑并绘制轨迹线
+                    if (left_track.size() >= 2 && right_track.size() >= 2) {
+                        // 平滑轨迹线（高斯滤波）
+                        auto smooth_track = [](std::vector<cv::Point>& track) {
+                            if (track.size() < 2) return; // 至少需要2个点
+                            std::vector<float> x_coords(track.size()), y_coords(track.size());
+                            for (size_t i = 0; i < track.size(); i++) {
+                                x_coords[i] = static_cast<float>(track[i].x);
+                                y_coords[i] = static_cast<float>(track[i].y);
+                            }
+
+                            cv::Mat x_mat(x_coords, true), y_mat(y_coords, true);
+                            cv::GaussianBlur(x_mat, x_mat, cv::Size(9, 1), 2.0, 0, cv::BORDER_REFLECT);
+                            cv::GaussianBlur(y_mat, y_mat, cv::Size(9, 1), 2.0, 0, cv::BORDER_REFLECT);
+
+                            for (size_t i = 0; i < track.size(); i++) {
+                                track[i] = cv::Point(static_cast<int>(x_mat.at<float>(i)), static_cast<int>(y_mat.at<float>(i)));
+                            }
+                        };
+
+                        smooth_track(left_track);
+                        smooth_track(right_track);
+                        smooth_track(middle_track);
+
+                        // 绘制轨迹线（两侧轨迹线为蓝色，中间轨迹线为白色）
+                        for (size_t i = 1; i < left_track.size(); i++) {
+                            cv::line(frame, left_track[i - 1], left_track[i], cv::Scalar(255, 0, 0), 2); // 蓝色左侧
+                            cv::line(frame, right_track[i - 1], right_track[i], cv::Scalar(255, 0, 0), 2); // 蓝色右侧
+                            cv::line(frame, middle_track[i - 1], middle_track[i], cv::Scalar(255, 255, 255), 2); // 白色中间
+                        }
+                    } else {
+                        printf("Frame %d: Too few track points, skipping track drawing\n", ordered_frame.frame_index);
+                    }
+                } else {
+                    printf("Frame %d: Too few mask pixels, skipping track drawing\n", ordered_frame.frame_index);
+                }
+            } else {
+                printf("Frame %d: No valid mask data\n", ordered_frame.frame_index);
             }
 
             // 绘制边界框和标签
@@ -603,13 +779,12 @@ void saveThread(const std::string& video_source) {
             }
 
             // 保存视频
-           // writer.write(frame);
+            // writer.write(frame);
             frame_count++;
 
-            #if ENABLE_TCP_SENDER
-            // 将处理后的帧推送到processed_queue供TCP发送
-                processed_queue.push(FrameData(frame, ordered_frame.frame_index, ordered_frame.od_results));
-            #endif
+    #if ENABLE_TCP_SENDER
+            processed_queue.push(FrameData(frame, ordered_frame.frame_index, ordered_frame.od_results));
+    #endif
 
             // 释放掩码内存
             if (ordered_frame.od_results.count > 0 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
@@ -629,6 +804,477 @@ void saveThread(const std::string& video_source) {
     writer.release();
     printf("Video saved as '%s' with %d frames\n", filename, frame_count);
 }
+#endif
+
+
+#if GAUSSIANBLUR
+void saveThread(const std::string& video_source) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(1, &mask);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
+        printf("Set thread affinity failed for save thread\n");
+    printf("Bind save thread on CPU 1\n");
+
+    cv::VideoCapture cap(video_source.empty() || video_source == "0" ? 0 : video_source);
+    if (!cap.isOpened()) {
+        printf("Error: Could not open video source for properties\n");
+        return;
+    }
+    int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    double fps = cap.get(cv::CAP_PROP_FPS);
+    if (fps <= 0) fps = 30.0;
+    cap.release();
+
+    cv::VideoWriter writer;
+    const char* filename = "output_video.mp4";
+    int codec = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+    writer.open(filename, codec, fps, cv::Size(width, height), true);
+    if (!writer.isOpened()) {
+        printf("Error: Could not open video writer\n");
+        return;
+    }
+
+    std::map<int, FrameData> frame_buffer;
+    const int MAX_BUFFER_SIZE = 100;
+    int expected_index = 0;
+    int frame_count = 0;
+    bool end_signal_received = false;
+
+    while (running || !output_queue.empty() || !frame_buffer.empty()) {
+        FrameData frame_data;
+        if (output_queue.pop(frame_data)) {
+            if (!frame_data.is_valid) {
+                end_signal_received = true;
+            } else {
+                frame_buffer[frame_data.frame_index] = frame_data;
+                if (frame_buffer.size() > MAX_BUFFER_SIZE) {
+                    int oldest_index = frame_buffer.begin()->first;
+                    if (oldest_index < expected_index) {
+                        printf("Warning: Buffer full, dropping frame %d\n", oldest_index);
+                        frame_buffer.erase(oldest_index);
+                    }
+                }
+            }
+        }
+
+        while (frame_buffer.find(expected_index) != frame_buffer.end()) {
+            FrameData& ordered_frame = frame_buffer[expected_index];
+            cv::Mat& frame = ordered_frame.frame;
+
+            // 绘制掩码和轨迹线
+            if (ordered_frame.od_results.count >= 1 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
+                uint8_t* seg_mask = ordered_frame.od_results.results_seg[0].seg_mask;
+                float alpha = 0.5f; // 透明度
+                int mask_pixel_count = 0;
+                for (int j = 0; j < height; j++) {
+                    for (int k = 0; k < width; k++) {
+                        int idx = j * width + k;
+                        if (seg_mask[idx] != 0) {
+                            mask_pixel_count++;
+                            int cls_idx = seg_mask[idx] % 20;
+                            uchar* pixel = frame.ptr<uchar>(j, k);
+                            pixel[2] = (uchar)(class_colors[cls_idx][0] * (1 - alpha) + pixel[2] * alpha); // R
+                            pixel[1] = (uchar)(class_colors[cls_idx][1] * (1 - alpha) + pixel[1] * alpha); // G
+                            pixel[0] = (uchar)(class_colors[cls_idx][2] * (1 - alpha) + pixel[0] * alpha); // B
+                        }
+                    }
+                }
+                printf("Frame %d: Mask pixel count: %d\n", ordered_frame.frame_index, mask_pixel_count);
+
+                // 如果掩码像素数量足够，尝试绘制轨迹线
+                if (mask_pixel_count >= 100) {
+                    // 逐行扫描掩码，提取左右轨迹线
+                    std::vector<cv::Point> left_track, right_track, middle_track;
+                    for (int y = 0; y < height; y++) {
+                        int left_x = -1, right_x = -1;
+                        for (int x = 0; x < width; x++) {
+                            int idx = y * width + x;
+                            if (seg_mask[idx] != 0) {
+                                if (left_x == -1) left_x = x; // 左侧边界
+                                right_x = x; // 右侧边界
+                            }
+                        }
+                        if (left_x != -1 && right_x != -1) {
+                            left_track.emplace_back(left_x, y);
+                            right_track.emplace_back(right_x, y);
+                            middle_track.emplace_back((left_x + right_x) / 2, y);
+                        }
+                    }
+
+                    printf("Frame %d: Left track: %zu, Right track: %zu, Middle track: %zu\n",
+                           ordered_frame.frame_index, left_track.size(), right_track.size(), middle_track.size());
+
+                    // 如果轨迹点足够，平滑并绘制轨迹线
+                    if (left_track.size() >= 2 && right_track.size() >= 2) {
+                        // 平滑轨迹线（高斯滤波，增强平滑效果）
+                        auto smooth_track = [](std::vector<cv::Point>& track) {
+                            if (track.size() < 2) return; // 至少需要2个点
+                            std::vector<float> x_coords(track.size()), y_coords(track.size());
+                            for (size_t i = 0; i < track.size(); i++) {
+                                x_coords[i] = static_cast<float>(track[i].x);
+                                y_coords[i] = static_cast<float>(track[i].y);
+                            }
+
+                            cv::Mat x_mat(x_coords, true), y_mat(y_coords, true);
+                            // 增大窗口和 sigma，增强平滑
+                            cv::GaussianBlur(x_mat, x_mat, cv::Size(15, 1), 3.0, 0, cv::BORDER_REFLECT);
+                            cv::GaussianBlur(y_mat, y_mat, cv::Size(15, 1), 3.0, 0, cv::BORDER_REFLECT);
+
+                            for (size_t i = 0; i < track.size(); i++) {
+                                track[i] = cv::Point(static_cast<int>(x_mat.at<float>(i)), static_cast<int>(y_mat.at<float>(i)));
+                            }
+                        };
+
+                        // 单帧平滑
+                        smooth_track(left_track);
+                        smooth_track(right_track);
+                        smooth_track(middle_track);
+
+                        // 帧间平滑（temporal smoothing）
+                        if (!left_track_history.empty() && !right_track_history.empty() && !middle_track_history.empty()) {
+                            // 确保当前帧轨迹点数量与历史帧一致（取最小长度）
+                            size_t min_size = std::min({left_track.size(), left_track_history.back().size()});
+                            left_track.resize(min_size);
+                            right_track.resize(min_size);
+                            middle_track.resize(min_size);
+
+                            // 加权平均
+                            for (size_t i = 0; i < min_size; i++) {
+                                float avg_left_x = 0, avg_left_y = 0;
+                                float avg_right_x = 0, avg_right_y = 0;
+                                float avg_middle_x = 0, avg_middle_y = 0;
+                                float total_weight = 0;
+                                float current_weight = ALPHA;
+
+                                // 当前帧
+                                avg_left_x += current_weight * left_track[i].x;
+                                avg_left_y += current_weight * left_track[i].y;
+                                avg_right_x += current_weight * right_track[i].x;
+                                avg_right_y += current_weight * right_track[i].y;
+                                avg_middle_x += current_weight * middle_track[i].x;
+                                avg_middle_y += current_weight * middle_track[i].y;
+                                total_weight += current_weight;
+
+                                // 历史帧
+                                float history_weight = (1.0f - ALPHA) / left_track_history.size();
+                                for (size_t j = 0; j < left_track_history.size(); j++) {
+                                    if (i < left_track_history[j].size()) {
+                                        avg_left_x += history_weight * left_track_history[j][i].x;
+                                        avg_left_y += history_weight * left_track_history[j][i].y;
+                                        avg_right_x += history_weight * right_track_history[j][i].x;
+                                        avg_right_y += history_weight * right_track_history[j][i].y;
+                                        avg_middle_x += history_weight * middle_track_history[j][i].x;
+                                        avg_middle_y += history_weight * middle_track_history[j][i].y;
+                                        total_weight += history_weight;
+                                    }
+                                }
+
+                                // 更新当前帧轨迹点
+                                left_track[i] = cv::Point(static_cast<int>(avg_left_x / total_weight),
+                                                         static_cast<int>(avg_left_y / total_weight));
+                                right_track[i] = cv::Point(static_cast<int>(avg_right_x / total_weight),
+                                                          static_cast<int>(avg_right_y / total_weight));
+                                middle_track[i] = cv::Point(static_cast<int>(avg_middle_x / total_weight),
+                                                           static_cast<int>(avg_middle_y / total_weight));
+                            }
+                        }
+
+                        // 更新历史轨迹
+                        left_track_history.push_back(left_track);
+                        right_track_history.push_back(right_track);
+                        middle_track_history.push_back(middle_track);
+                        if (left_track_history.size() > HISTORY_SIZE) {
+                            left_track_history.pop_front();
+                            right_track_history.pop_front();
+                            middle_track_history.pop_front();
+                        }
+
+                        // 绘制轨迹线（两侧轨迹线为蓝色，中间轨迹线为白色）
+                        for (size_t i = 1; i < left_track.size(); i++) {
+                            cv::line(frame, left_track[i - 1], left_track[i], cv::Scalar(255, 0, 0), 2); // 蓝色左侧
+                            cv::line(frame, right_track[i - 1], right_track[i], cv::Scalar(255, 0, 0), 2); // 蓝色右侧
+                            cv::line(frame, middle_track[i - 1], middle_track[i], cv::Scalar(255, 255, 255), 2); // 白色中间
+                        }
+                    } else {
+                        printf("Frame %d: Too few track points, skipping track drawing\n", ordered_frame.frame_index);
+                    }
+                } else {
+                    printf("Frame %d: Too few mask pixels, skipping track drawing\n", ordered_frame.frame_index);
+                }
+            } else {
+                printf("Frame %d: No valid mask data\n", ordered_frame.frame_index);
+            }
+
+            // 绘制边界框和标签
+            for (int i = 0; i < ordered_frame.od_results.count; i++) {
+                object_detect_result* det_result = &ordered_frame.od_results.results[i];
+                int x1 = det_result->box.left;
+                int y1 = det_result->box.top;
+                int x2 = det_result->box.right;
+                int y2 = det_result->box.bottom;
+                int cls_id = det_result->cls_id;
+
+                cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 0, 255), 3);
+                char text[256];
+                snprintf(text, sizeof(text), "%s %.1f%%", coco_cls_to_name(cls_id), det_result->prop * 100);
+                cv::putText(frame, text, cv::Point(x1, y1 - 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+            }
+
+            // 保存视频
+            // writer.write(frame);
+            frame_count++;
+
+        #if ENABLE_TCP_SENDER
+            processed_queue.push(FrameData(frame, ordered_frame.frame_index, ordered_frame.od_results));
+        #endif
+
+            // 释放掩码内存
+            if (ordered_frame.od_results.count > 0 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
+                free(ordered_frame.od_results.results_seg[0].seg_mask);
+                ordered_frame.od_results.results_seg[0].seg_mask = nullptr;
+            }
+
+            frame_buffer.erase(expected_index);
+            expected_index++;
+        }
+
+        if (end_signal_received && frame_buffer.empty()) {
+            break;
+        }
+    }
+
+    writer.release();
+    printf("Video saved as '%s' with %d frames\n", filename, frame_count);
+}
+#endif
+
+
+#if CUBICSPLINE
+void saveThread(const std::string& video_source) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(1, &mask);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
+        printf("Set thread affinity failed for save thread\n");
+    printf("Bind save thread on CPU 1\n");
+
+    cv::VideoCapture cap(video_source.empty() || video_source == "0" ? 0 : video_source);
+    if (!cap.isOpened()) {
+        printf("Error: Could not open video source for properties\n");
+        return;
+    }
+    int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    double fps = cap.get(cv::CAP_PROP_FPS);
+    if (fps <= 0) fps = 30.0;
+    cap.release();
+
+    cv::VideoWriter writer;
+    const char* filename = "output_video.mp4";
+    int codec = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+    writer.open(filename, codec, fps, cv::Size(width, height), true);
+    if (!writer.isOpened()) {
+        printf("Error: Could not open video writer\n");
+        return;
+    }
+
+    std::map<int, FrameData> frame_buffer;
+    const int MAX_BUFFER_SIZE = 100;
+    int expected_index = 0;
+    int frame_count = 0;
+    bool end_signal_received = false;
+
+    while (running || !output_queue.empty() || !frame_buffer.empty()) {
+        FrameData frame_data;
+        if (output_queue.pop(frame_data)) {
+            if (!frame_data.is_valid) {
+                end_signal_received = true;
+            } else {
+                frame_buffer[frame_data.frame_index] = frame_data;
+                if (frame_buffer.size() > MAX_BUFFER_SIZE) {
+                    int oldest_index = frame_buffer.begin()->first;
+                    if (oldest_index < expected_index) {
+                        printf("Warning: Buffer full, dropping frame %d\n", oldest_index);
+                        frame_buffer.erase(oldest_index);
+                    }
+                }
+            }
+        }
+
+        while (frame_buffer.find(expected_index) != frame_buffer.end()) {
+            FrameData& ordered_frame = frame_buffer[expected_index];
+            cv::Mat& frame = ordered_frame.frame;
+
+            // 绘制掩码和轨迹线
+            if (ordered_frame.od_results.count >= 1 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
+                uint8_t* seg_mask = ordered_frame.od_results.results_seg[0].seg_mask;
+                float alpha = 0.5f; // 透明度
+                int mask_pixel_count = 0;
+                for (int j = 0; j < height; j++) {
+                    for (int k = 0; k < width; k++) {
+                        int idx = j * width + k;
+                        if (seg_mask[idx] != 0) {
+                            mask_pixel_count++;
+                            int cls_idx = seg_mask[idx] % 20;
+                            uchar* pixel = frame.ptr<uchar>(j, k);
+                            pixel[2] = (uchar)(class_colors[cls_idx][0] * (1 - alpha) + pixel[2] * alpha); // R
+                            pixel[1] = (uchar)(class_colors[cls_idx][1] * (1 - alpha) + pixel[1] * alpha); // G
+                            pixel[0] = (uchar)(class_colors[cls_idx][2] * (1 - alpha) + pixel[0] * alpha); // B
+                        }
+                    }
+                }
+                printf("Frame %d: Mask pixel count: %d\n", ordered_frame.frame_index, mask_pixel_count);
+
+                // 如果掩码像素数量足够，尝试绘制轨迹线
+                if (mask_pixel_count >= 100) {
+                    // 逐行扫描掩码，提取左右轨迹线
+                    std::vector<cv::Point> left_track, right_track, middle_track;
+                    for (int y = 0; y < height; y++) {
+                        int left_x = -1, right_x = -1;
+                        for (int x = 0; x < width; x++) {
+                            int idx = y * width + x;
+                            if (seg_mask[idx] != 0) {
+                                if (left_x == -1) left_x = x; // 左侧边界
+                                right_x = x; // 右侧边界
+                            }
+                        }
+                        if (left_x != -1 && right_x != -1) {
+                            left_track.emplace_back(left_x, y);
+                            right_track.emplace_back(right_x, y);
+                            middle_track.emplace_back((left_x + right_x) / 2, y);
+                        }
+                    }
+
+                    printf("Frame %d: Left track: %zu, Right track: %zu, Middle track: %zu\n",
+                           ordered_frame.frame_index, left_track.size(), right_track.size(), middle_track.size());
+
+                    // 如果轨迹点足够，平滑并绘制轨迹线
+                    if (left_track.size() >= 2 && right_track.size() >= 2) {
+                        // 插值生成均匀分布的轨迹点（目标 300 个点）
+                        const int TARGET_POINTS = 300;
+                        interpolate_track(left_track, TARGET_POINTS);
+                        interpolate_track(right_track, TARGET_POINTS);
+                        interpolate_track(middle_track, TARGET_POINTS);
+
+                        // 帧间平滑（temporal smoothing）
+                        if (!left_track_history.empty() && !right_track_history.empty() && !middle_track_history.empty()) {
+                            // 确保当前帧轨迹点数量与历史帧一致
+                            size_t min_size = std::min({left_track.size(), left_track_history.back().size()});
+                            left_track.resize(min_size);
+                            right_track.resize(min_size);
+                            middle_track.resize(min_size);
+
+                            // 加权平均
+                            for (size_t i = 0; i < min_size; i++) {
+                                float avg_left_x = 0, avg_left_y = 0;
+                                float avg_right_x = 0, avg_right_y = 0;
+                                float avg_middle_x = 0, avg_middle_y = 0;
+                                float total_weight = 0;
+                                float current_weight = ALPHA;
+
+                                // 当前帧
+                                avg_left_x += current_weight * left_track[i].x;
+                                avg_left_y += current_weight * left_track[i].y;
+                                avg_right_x += current_weight * right_track[i].x;
+                                avg_right_y += current_weight * right_track[i].y;
+                                avg_middle_x += current_weight * middle_track[i].x;
+                                avg_middle_y += current_weight * middle_track[i].y;
+                                total_weight += current_weight;
+
+                                // 历史帧
+                                float history_weight = (1.0f - ALPHA) / left_track_history.size();
+                                for (size_t j = 0; j < left_track_history.size(); j++) {
+                                    if (i < left_track_history[j].size()) {
+                                        avg_left_x += history_weight * left_track_history[j][i].x;
+                                        avg_left_y += history_weight * left_track_history[j][i].y;
+                                        avg_right_x += history_weight * right_track_history[j][i].x;
+                                        avg_right_y += history_weight * right_track_history[j][i].y;
+                                        avg_middle_x += history_weight * middle_track_history[j][i].x;
+                                        avg_middle_y += history_weight * middle_track_history[j][i].y;
+                                        total_weight += history_weight;
+                                    }
+                                }
+
+                                // 更新当前帧轨迹点
+                                left_track[i] = cv::Point(static_cast<int>(avg_left_x / total_weight),
+                                                         static_cast<int>(avg_left_y / total_weight));
+                                right_track[i] = cv::Point(static_cast<int>(avg_right_x / total_weight),
+                                                          static_cast<int>(avg_right_y / total_weight));
+                                middle_track[i] = cv::Point(static_cast<int>(avg_middle_x / total_weight),
+                                                           static_cast<int>(avg_middle_y / total_weight));
+                            }
+                        }
+
+                        // 更新历史轨迹
+                        left_track_history.push_back(left_track);
+                        right_track_history.push_back(right_track);
+                        middle_track_history.push_back(middle_track);
+                        if (left_track_history.size() > HISTORY_SIZE) {
+                            left_track_history.pop_front();
+                            right_track_history.pop_front();
+                            middle_track_history.pop_front();
+                        }
+
+                        // 绘制轨迹线（两侧轨迹线为蓝色，中间轨迹线为白色）
+                        for (size_t i = 1; i < left_track.size(); i++) {
+                            cv::line(frame, left_track[i - 1], left_track[i], cv::Scalar(255, 0, 0), 2); // 蓝色左侧
+                            cv::line(frame, right_track[i - 1], right_track[i], cv::Scalar(255, 0, 0), 2); // 蓝色右侧
+                            cv::line(frame, middle_track[i - 1], middle_track[i], cv::Scalar(255, 255, 255), 2); // 白色中间
+                        }
+                    } else {
+                        printf("Frame %d: Too few track points, skipping track drawing\n", ordered_frame.frame_index);
+                    }
+                } else {
+                    printf("Frame %d: Too few mask pixels, skipping track drawing\n", ordered_frame.frame_index);
+                }
+            } else {
+                printf("Frame %d: No valid mask data\n", ordered_frame.frame_index);
+            }
+
+            // 绘制边界框和标签
+            for (int i = 0; i < ordered_frame.od_results.count; i++) {
+                object_detect_result* det_result = &ordered_frame.od_results.results[i];
+                int x1 = det_result->box.left;
+                int y1 = det_result->box.top;
+                int x2 = det_result->box.right;
+                int y2 = det_result->box.bottom;
+                int cls_id = det_result->cls_id;
+
+                cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 0, 255), 3);
+                char text[256];
+                snprintf(text, sizeof(text), "%s %.1f%%", coco_cls_to_name(cls_id), det_result->prop * 100);
+                cv::putText(frame, text, cv::Point(x1, y1 - 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+            }
+
+            // 保存视频
+            // writer.write(frame);
+            frame_count++;
+
+    #if ENABLE_TCP_SENDER
+            processed_queue.push(FrameData(frame, ordered_frame.frame_index, ordered_frame.od_results));
+    #endif
+
+            // 释放掩码内存
+            if (ordered_frame.od_results.count > 0 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
+                free(ordered_frame.od_results.results_seg[0].seg_mask);
+                ordered_frame.od_results.results_seg[0].seg_mask = nullptr;
+            }
+
+            frame_buffer.erase(expected_index);
+            expected_index++;
+        }
+
+        if (end_signal_received && frame_buffer.empty()) {
+            break;
+        }
+    }
+
+    writer.release();
+    printf("Video saved as '%s' with %d frames\n", filename, frame_count);
+}
+#endif
 
 #if ENABLE_TCP_SENDER
 void tcpSenderThread() {
@@ -728,12 +1374,12 @@ int main(int argc, char **argv) {
     detect_thread3.detach();
 
     std::thread save_thread(saveThread, std::string(video_source));
-    setThreadAffinity(save_thread, 1);
+    setThreadAffinity(save_thread, 7);
     save_thread.detach();
 
 #if ENABLE_TCP_SENDER
     std::thread tcp_thread(tcpSenderThread);
-    setThreadAffinity(tcp_thread, 7);
+    setThreadAffinity(tcp_thread, 0);
     tcp_thread.detach();
 #endif
 
