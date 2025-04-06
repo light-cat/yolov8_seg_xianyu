@@ -22,6 +22,79 @@
 #include "file_utils.h"
 #include "image_drawing.h"
 #include "rknn_api.h"
+#define GPIO_CONTROL 1
+#if GPIO_CONTROL
+
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+// 定义GPIO引脚（需要根据实际硬件调整）
+#define GPIO_LEFT  123  // 假设这是左转向GPIO编号
+#define GPIO_RIGHT 124  // 假设这是右转向GPIO编号
+
+// 全局变量声明（需要在文件顶部添加）
+int gpio_left_fd = -1;
+int gpio_right_fd = -1;
+
+// GPIO初始化函数（需要在saveThread开始时调用）
+void initGPIO() {
+    char gpio_path[64];
+    
+    // 导出并配置左GPIO
+    int export_fd = open("/sys/class/gpio/export", O_WRONLY);
+    if (export_fd >= 0) {
+        sprintf(gpio_path, "%d", GPIO_LEFT);
+        write(export_fd, gpio_path, strlen(gpio_path));
+        close(export_fd);
+    }
+    
+    sprintf(gpio_path, "/sys/class/gpio/gpio%d/direction", GPIO_LEFT);
+    gpio_left_fd = open(gpio_path, O_WRONLY);
+    if (gpio_left_fd >= 0) {
+        write(gpio_left_fd, "out", 3);
+    }
+    
+    // 导出并配置右GPIO
+    export_fd = open("/sys/class/gpio/export", O_WRONLY);
+    if (export_fd >= 0) {
+        sprintf(gpio_path, "%d", GPIO_RIGHT);
+        write(export_fd, gpio_path, strlen(gpio_path));
+        close(export_fd);
+    }
+    
+    sprintf(gpio_path, "/sys/class/gpio/gpio%d/direction", GPIO_RIGHT);
+    gpio_right_fd = open(gpio_path, O_WRONLY);
+    if (gpio_right_fd >= 0) {
+        write(gpio_right_fd, "out", 3);
+    }
+}
+
+// GPIO清理函数（需要在saveThread结束时调用）
+void cleanupGPIO() {
+    if (gpio_left_fd >= 0) close(gpio_left_fd);
+    if (gpio_right_fd >= 0) close(gpio_right_fd);
+    
+    int unexport_fd = open("/sys/class/gpio/unexport", O_WRONLY);
+    if (unexport_fd >= 0) {
+        char gpio_path[64];
+        sprintf(gpio_path, "%d", GPIO_LEFT);
+        write(unexport_fd, gpio_path, strlen(gpio_path));
+        sprintf(gpio_path, "%d", GPIO_RIGHT);
+        write(unexport_fd, gpio_path, strlen(gpio_path));
+        close(unexport_fd);
+    }
+}
+
+// 设置GPIO电平
+void setGPIO(int fd, bool high) {
+    if (fd >= 0) {
+        lseek(fd, 0, SEEK_SET);
+        write(fd, high ? "1" : "0", 1);
+    }
+}
+#endif
+
 
 extern "C"
 {
@@ -625,7 +698,7 @@ void detectionThread(int npu_core, int thread_id, int cpu_id) {
 
 
 #if GAUSSIANBLUR
-#if 1
+#if 0
 void saveThread(const std::string& video_source) {
     cpu_set_t mask;
     CPU_ZERO(&mask);
@@ -659,6 +732,11 @@ void saveThread(const std::string& video_source) {
     int expected_index = 0;
     int frame_count = 0;
     bool end_signal_received = false;
+
+    #if GPIO_CONTROL
+        initGPIO();
+    #endif
+
 
     while (running || !output_queue.empty() || !frame_buffer.empty()) {
         FrameData frame_data;
@@ -818,7 +896,41 @@ void saveThread(const std::string& video_source) {
                             right_track_history.pop_front();
                             middle_track_history.pop_front();
                         }
+                        #if GPIO_CONTROL
+                                                    // 计算方向偏移并控制GPIO
+                        int image_center_x = width / 2;
+                        int track_center_x = middle_track[middle_track.size()/2].x;
+                        int offset = track_center_x - image_center_x;
+                        const int TURN_THRESHOLD = 50;
 
+                        if (offset > TURN_THRESHOLD) {
+                            setGPIO(gpio_left_fd, false);
+                            setGPIO(gpio_right_fd, true);
+                            cv::putText(frame, "Turn Right", cv::Point(20, 40),
+                                       cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+                            cv::arrowedLine(frame, cv::Point(image_center_x, height-50),
+                                          cv::Point(track_center_x, height-50),
+                                          cv::Scalar(0, 0, 255), 2);
+                            printf("Frame %d: Turn Right, offset: %d\n", ordered_frame.frame_index, offset);
+                        }
+                        else if (offset < -TURN_THRESHOLD) {
+                            setGPIO(gpio_left_fd, true);
+                            setGPIO(gpio_right_fd, false);
+                            cv::putText(frame, "Turn Left", cv::Point(20, 40),
+                                       cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+                            cv::arrowedLine(frame, cv::Point(image_center_x, height-50),
+                                          cv::Point(track_center_x, height-50),
+                                          cv::Scalar(0, 0, 255), 2);
+                            printf("Frame %d: Turn Left, offset: %d\n", ordered_frame.frame_index, offset);
+                        }
+                        else {
+                            setGPIO(gpio_left_fd, false);
+                            setGPIO(gpio_right_fd, false);
+                            cv::putText(frame, "Straight", cv::Point(20, 40),
+                                       cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+                            printf("Frame %d: Go Straight, offset: %d\n", ordered_frame.frame_index, offset);
+                        }
+                        #endif
                         // 绘制轨迹线（两侧轨迹线为蓝色，中间轨迹线为白色）
                         for (size_t i = 1; i < left_track.size(); i++) {
                             cv::line(frame, left_track[i - 1], left_track[i], cv::Scalar(255, 0, 0), 2); // 蓝色左侧
@@ -884,11 +996,766 @@ void saveThread(const std::string& video_source) {
             break;
         }
     }
-
+    #if GPIO_CONTROL
+        cleanupGPIO();
+    #endif
     writer.release();
     printf("Video saved as '%s' with %d frames\n", filename, frame_count);
 }
 #endif
+
+#if 0 //除了没搞出前试点，其他都挺好的
+void saveThread(const std::string& video_source) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(1, &mask);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
+        printf("Set thread affinity failed for save thread\n");
+    printf("Bind save thread on CPU 1\n");
+
+    cv::VideoCapture cap(video_source.empty() || video_source == "0" ? 0 : video_source);
+    if (!cap.isOpened()) {
+        printf("Error: Could not open video source for properties\n");
+        return;
+    }
+    int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    double fps = cap.get(cv::CAP_PROP_FPS);
+    if (fps <= 0) fps = 30.0;
+    cap.release();
+
+    cv::VideoWriter writer;
+    const char* filename = "output_video.mp4";
+    int codec = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+    writer.open(filename, codec, fps, cv::Size(width, height), true);
+    if (!writer.isOpened()) {
+        printf("Error: Could not open video writer\n");
+        return;
+    }
+
+    std::map<int, FrameData> frame_buffer;
+    const int MAX_BUFFER_SIZE = 100;
+    int expected_index = 0;
+    int frame_count = 0;
+    bool end_signal_received = false;
+
+    #if GPIO_CONTROL
+        initGPIO();
+    #endif
+
+    while (running || !output_queue.empty() || !frame_buffer.empty()) {
+        FrameData frame_data;
+        if (output_queue.pop(frame_data)) {
+            if (!frame_data.is_valid) {
+                end_signal_received = true;
+            } else {
+                frame_buffer[frame_data.frame_index] = frame_data;
+                if (frame_buffer.size() > MAX_BUFFER_SIZE) {
+                    int oldest_index = frame_buffer.begin()->first;
+                    if (oldest_index < expected_index) {
+                        printf("Warning: Buffer full, dropping frame %d\n", oldest_index);
+                        frame_buffer.erase(oldest_index);
+                    }
+                }
+            }
+        }
+
+        while (frame_buffer.find(expected_index) != frame_buffer.end()) {
+            FrameData& ordered_frame = frame_buffer[expected_index];
+            cv::Mat& frame = ordered_frame.frame;
+
+            // 绘制掩码和轨迹线（保持原有逻辑）
+            if (ordered_frame.od_results.count >= 1 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
+                uint8_t* seg_mask = ordered_frame.od_results.results_seg[0].seg_mask;
+                float alpha = 0.5f;
+                int mask_pixel_count = 0;
+                for (int j = 0; j < height; j++) {
+                    for (int k = 0; k < width; k++) {
+                        int idx = j * width + k;
+                        if (seg_mask[idx] != 0) {
+                            mask_pixel_count++;
+                            int cls_idx = seg_mask[idx] % 20;
+                            uchar* pixel = frame.ptr<uchar>(j, k);
+                            pixel[2] = (uchar)(class_colors[cls_idx][0] * (1 - alpha) + pixel[2] * alpha); // R
+                            pixel[1] = (uchar)(class_colors[cls_idx][1] * (1 - alpha) + pixel[1] * alpha); // G
+                            pixel[0] = (uchar)(class_colors[cls_idx][2] * (1 - alpha) + pixel[0] * alpha); // B
+                        }
+                    }
+                }
+                printf("Frame %d: Mask pixel count: %d\n", ordered_frame.frame_index, mask_pixel_count);
+
+                if (mask_pixel_count >= 100) {
+                    std::vector<cv::Point> left_track, right_track, middle_track;
+                    for (int y = 0; y < height; y++) {
+                        int left_x = -1, right_x = -1;
+                        for (int x = 0; x < width; x++) {
+                            int idx = y * width + x;
+                            if (seg_mask[idx] != 0) {
+                                if (left_x == -1) left_x = x;
+                                right_x = x;
+                            }
+                        }
+                        if (left_x != -1 && right_x != -1) {
+                            left_track.emplace_back(left_x, y);
+                            right_track.emplace_back(right_x, y);
+                            middle_track.emplace_back((left_x + right_x) / 2, y);
+                        }
+                    }
+
+                    printf("Frame %d: Left track: %zu, Right track: %zu, Middle track: %zu\n",
+                           ordered_frame.frame_index, left_track.size(), right_track.size(), middle_track.size());
+
+                    if (left_track.size() >= 2 && right_track.size() >= 2) {
+                        // 平滑轨迹线（保持原有高斯滤波）
+                        auto smooth_track = [](std::vector<cv::Point>& track) {
+                            if (track.size() < 2) return;
+                            std::vector<float> x_coords(track.size()), y_coords(track.size());
+                            for (size_t i = 0; i < track.size(); i++) {
+                                x_coords[i] = static_cast<float>(track[i].x);
+                                y_coords[i] = static_cast<float>(track[i].y);
+                            }
+                            cv::Mat x_mat(x_coords, true), y_mat(y_coords, true);
+                            cv::GaussianBlur(x_mat, x_mat, cv::Size(9, 1), 2.0, 0, cv::BORDER_REFLECT);
+                            cv::GaussianBlur(y_mat, y_mat, cv::Size(9, 1), 2.0, 0, cv::BORDER_REFLECT);
+                            for (size_t i = 0; i < track.size(); i++) {
+                                track[i] = cv::Point(static_cast<int>(x_mat.at<float>(i)), static_cast<int>(y_mat.at<float>(i)));
+                            }
+                        };
+
+                        smooth_track(left_track);
+                        smooth_track(right_track);
+                        smooth_track(middle_track);
+
+                        // 帧间平滑（保持原有逻辑）
+                        if (!left_track_history.empty() && !right_track_history.empty() && !middle_track_history.empty()) {
+                            size_t target_size = left_track.size();
+                            std::vector<cv::Point> smoothed_left_track(target_size), smoothed_right_track(target_size), smoothed_middle_track(target_size);
+
+                            for (size_t i = 0; i < target_size; i++) {
+                                float avg_left_x = 0, avg_left_y = 0;
+                                float avg_right_x = 0, avg_right_y = 0;
+                                float avg_middle_x = 0, avg_middle_y = 0;
+                                float total_weight = 0;
+                                float current_weight = ALPHA;
+
+                                avg_left_x += current_weight * left_track[i].x;
+                                avg_left_y += current_weight * left_track[i].y;
+                                avg_right_x += current_weight * right_track[i].x;
+                                avg_right_y += current_weight * right_track[i].y;
+                                avg_middle_x += current_weight * middle_track[i].x;
+                                avg_middle_y += current_weight * middle_track[i].y;
+                                total_weight += current_weight;
+
+                                float history_weight = (1.0f - ALPHA) / left_track_history.size();
+                                for (size_t j = 0; j < left_track_history.size(); j++) {
+                                    const auto& hist_left = left_track_history[j];
+                                    const auto& hist_right = right_track_history[j];
+                                    const auto& hist_middle = middle_track_history[j];
+                                    if (!hist_left.empty()) {
+                                        size_t hist_size = hist_left.size();
+                                        size_t hist_idx = static_cast<size_t>((static_cast<float>(i) / target_size) * hist_size);
+                                        hist_idx = std::min(hist_idx, hist_size - 1);
+
+                                        avg_left_x += history_weight * hist_left[hist_idx].x;
+                                        avg_left_y += history_weight * hist_left[hist_idx].y;
+                                        avg_right_x += history_weight * hist_right[hist_idx].x;
+                                        avg_right_y += history_weight * hist_right[hist_idx].y;
+                                        avg_middle_x += history_weight * hist_middle[hist_idx].x;
+                                        avg_middle_y += history_weight * hist_middle[hist_idx].y;
+                                        total_weight += history_weight;
+                                    }
+                                }
+
+                                smoothed_left_track[i] = cv::Point(static_cast<int>(avg_left_x / total_weight),
+                                                                  static_cast<int>(avg_left_y / total_weight));
+                                smoothed_right_track[i] = cv::Point(static_cast<int>(avg_right_x / total_weight),
+                                                                   static_cast<int>(avg_right_y / total_weight));
+                                smoothed_middle_track[i] = cv::Point(static_cast<int>(avg_middle_x / total_weight),
+                                                                    static_cast<int>(avg_middle_y / total_weight));
+                            }
+
+                            left_track = smoothed_left_track;
+                            right_track = smoothed_right_track;
+                            middle_track = smoothed_middle_track;
+                        }
+
+                        // 更新历史轨迹（保持原有逻辑）
+                        left_track_history.push_back(left_track);
+                        right_track_history.push_back(right_track);
+                        middle_track_history.push_back(middle_track);
+                        if (left_track_history.size() > HISTORY_SIZE) {
+                            left_track_history.pop_front();
+                            right_track_history.pop_front();
+                            middle_track_history.pop_front();
+                        }
+
+                        #if GPIO_CONTROL
+                        // 计算小车动态位置（图像下半部分1/2处，两个蓝色轨迹线的中间点）
+                        int car_y = height * 3 / 4; // 图像下半部分1/2处
+                        int car_x = width / 2;      // 默认值，稍后动态调整
+                        cv::Point car_position(car_x, car_y);
+
+                        // 在left_track和right_track中找到y最接近car_y的点
+                        int left_x = -1, right_x = -1;
+                        int min_y_diff = height; // 初始化为最大值
+                        for (size_t i = 0; i < left_track.size() && i < right_track.size(); i++) {
+                            int y_diff = std::abs(left_track[i].y - car_y);
+                            if (y_diff < min_y_diff) {
+                                min_y_diff = y_diff;
+                                left_x = left_track[i].x;
+                                right_x = right_track[i].x;
+                            }
+                        }
+                        if (left_x != -1 && right_x != -1) {
+                            car_x = (left_x + right_x) / 2; // 动态计算x坐标
+                            car_position = cv::Point(car_x, car_y);
+                        }
+
+                        // 选择上半部分的前视点（例如图像高度的1/4处）
+                        cv::Point lookahead_point = cv::Point(car_x, car_y); // 默认值
+                        int target_y = height / 4; // 前视点目标高度（上半部分）
+                        for (size_t i = 0; i < middle_track.size(); i++) {
+                            if (middle_track[i].y <= target_y) {
+                                lookahead_point = middle_track[i];
+                                break;
+                            }
+                        }
+
+                        // 计算偏移角度
+                        float dx = lookahead_point.x - car_x;
+                        float dy = car_y - lookahead_point.y; // 注意坐标系方向
+                        float steering_angle = std::atan2(dx, dy); // 弧度
+                        float steering_angle_deg = steering_angle * 180.0f / CV_PI; // 转换为度数
+
+                        // 根据偏移角度控制方向（保留原有阈值逻辑）
+                        const int TURN_THRESHOLD = 50;
+                        int offset = lookahead_point.x - car_x;
+
+                        if (offset > TURN_THRESHOLD) {
+                            setGPIO(gpio_left_fd, false);
+                            setGPIO(gpio_right_fd, true);
+                            cv::putText(frame, "Turn Right", cv::Point(20, 40),
+                                       cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+                            printf("Frame %d: Turn Right, angle: %.2f deg\n", ordered_frame.frame_index, steering_angle_deg);
+                        }
+                        else if (offset < -TURN_THRESHOLD) {
+                            setGPIO(gpio_left_fd, true);
+                            setGPIO(gpio_right_fd, false);
+                            cv::putText(frame, "Turn Left", cv::Point(20, 40),
+                                       cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+                            printf("Frame %d: Turn Left, angle: %.2f deg\n", ordered_frame.frame_index, steering_angle_deg);
+                        }
+                        else {
+                            setGPIO(gpio_left_fd, false);
+                            setGPIO(gpio_right_fd, false);
+                            cv::putText(frame, "Straight", cv::Point(20, 40),
+                                       cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+                            printf("Frame %d: Go Straight, angle: %.2f deg\n", ordered_frame.frame_index, steering_angle_deg);
+                        }
+
+                        // 绘制前视点（绿色圆点）
+                        cv::circle(frame, lookahead_point, 5, cv::Scalar(0, 255, 0), -1);
+
+                        // 绘制小车位置（红色三角形）
+                        std::vector<cv::Point> car_icon;
+                        car_icon.push_back(cv::Point(car_x, car_y - 10));        // 上顶点
+                        car_icon.push_back(cv::Point(car_x - 10, car_y + 10));  // 左下角
+                        car_icon.push_back(cv::Point(car_x + 10, car_y + 10));  // 右下角
+                        cv::fillPoly(frame, std::vector<std::vector<cv::Point>>{car_icon}, cv::Scalar(0, 0, 255));
+
+                        // 绘制偏移角度示意图
+                        int indicator_x = width - 100; // 示意图放在右下角
+                        int indicator_y = height - 50;
+                        cv::Point indicator_center(indicator_x, indicator_y);
+
+                        // 绘制竖直线（绿色，表示直行方向）
+                        cv::line(frame, cv::Point(indicator_x, indicator_y - 30), cv::Point(indicator_x, indicator_y + 30),
+                                 cv::Scalar(0, 255, 0), 1);
+
+                        // 绘制偏移角度线（红色）
+                        float angle_rad = steering_angle;
+                        int line_length = 30;
+                        int end_x = indicator_x + static_cast<int>(line_length * std::sin(angle_rad));
+                        int end_y = indicator_y - static_cast<int>(line_length * std::cos(angle_rad));
+                        cv::line(frame, indicator_center, cv::Point(end_x, end_y), cv::Scalar(0, 0, 255), 2);
+
+                        // 标注角度值
+                        char angle_text[32];
+                        snprintf(angle_text, sizeof(angle_text), "%.1f deg", steering_angle_deg);
+                        cv::putText(frame, angle_text, cv::Point(indicator_x + 5, indicator_y - 35),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+                        #endif
+
+                        // 绘制轨迹线（保持原有逻辑）
+                        for (size_t i = 1; i < left_track.size(); i++) {
+                            cv::line(frame, left_track[i - 1], left_track[i], cv::Scalar(255, 0, 0), 2);
+                            cv::line(frame, right_track[i - 1], right_track[i], cv::Scalar(255, 0, 0), 2);
+                            cv::line(frame, middle_track[i - 1], middle_track[i], cv::Scalar(255, 255, 255), 2);
+                        }
+                    } else {
+                        printf("Frame %d: Too few track points, clearing history and skipping track drawing\n", ordered_frame.frame_index);
+                        left_track_history.clear();
+                        right_track_history.clear();
+                        middle_track_history.clear();
+                    }
+                } else {
+                    printf("Frame %d: Too few mask pixels, clearing history and skipping track drawing\n", ordered_frame.frame_index);
+                    left_track_history.clear();
+                    right_track_history.clear();
+                    middle_track_history.clear();
+                }
+            } else {
+                printf("Frame %d: No valid mask data, clearing history\n", ordered_frame.frame_index);
+                left_track_history.clear();
+                right_track_history.clear();
+                middle_track_history.clear();
+            }
+
+            // 绘制边界框和标签（保持原有逻辑）
+            for (int i = 0; i < ordered_frame.od_results.count; i++) {
+                object_detect_result* det_result = &ordered_frame.od_results.results[i];
+                int x1 = det_result->box.left;
+                int y1 = det_result->box.top;
+                int x2 = det_result->box.right;
+                int y2 = det_result->box.bottom;
+                int cls_id = det_result->cls_id;
+
+                cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 0, 255), 3);
+                char text[256];
+                snprintf(text, sizeof(text), "%s %.1f%%", coco_cls_to_name(cls_id), det_result->prop * 100);
+                cv::putText(frame, text, cv::Point(x1, y1 - 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+            }
+
+            // 保存视频（保持原有逻辑）
+            // writer.write(frame);
+            frame_count++;
+
+            #if ENABLE_TCP_SENDER
+            processed_queue.push(FrameData(frame, ordered_frame.frame_index, ordered_frame.od_results));
+            #endif
+
+            // 释放掩码内存（保持原有逻辑）
+            if (ordered_frame.od_results.count > 0 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
+                free(ordered_frame.od_results.results_seg[0].seg_mask);
+                ordered_frame.od_results.results_seg[0].seg_mask = nullptr;
+            }
+
+            frame_buffer.erase(expected_index);
+            expected_index++;
+        }
+
+        if (end_signal_received && frame_buffer.empty()) {
+            break;
+        }
+    }
+
+    #if GPIO_CONTROL
+        cleanupGPIO();
+    #endif
+    writer.release();
+    printf("Video saved as '%s' with %d frames\n", filename, frame_count);
+}
+#endif
+
+void saveThread(const std::string& video_source) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(1, &mask);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) < 0)
+        printf("Set thread affinity failed for save thread\n");
+    printf("Bind save thread on CPU 1\n");
+
+    cv::VideoCapture cap(video_source.empty() || video_source == "0" ? 0 : video_source);
+    if (!cap.isOpened()) {
+        printf("Error: Could not open video source for properties\n");
+        return;
+    }
+    int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    double fps = cap.get(cv::CAP_PROP_FPS);
+    if (fps <= 0) fps = 30.0;
+    cap.release();
+
+    cv::VideoWriter writer;
+    const char* filename = "output_video.mp4";
+    int codec = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+    writer.open(filename, codec, fps, cv::Size(width, height), true);
+    if (!writer.isOpened()) {
+        printf("Error: Could not open video writer\n");
+        return;
+    }
+
+    std::map<int, FrameData> frame_buffer;
+    const int MAX_BUFFER_SIZE = 100;
+    int expected_index = 0;
+    int frame_count = 0;
+    bool end_signal_received = false;
+
+    #if GPIO_CONTROL
+        initGPIO();
+    #endif
+
+    while (running || !output_queue.empty() || !frame_buffer.empty()) {
+        FrameData frame_data;
+        if (output_queue.pop(frame_data)) {
+            if (!frame_data.is_valid) {
+                end_signal_received = true;
+            } else {
+                frame_buffer[frame_data.frame_index] = frame_data;
+                if (frame_buffer.size() > MAX_BUFFER_SIZE) {
+                    int oldest_index = frame_buffer.begin()->first;
+                    if (oldest_index < expected_index) {
+                        printf("Warning: Buffer full, dropping frame %d\n", oldest_index);
+                        frame_buffer.erase(oldest_index);
+                    }
+                }
+            }
+        }
+
+        while (frame_buffer.find(expected_index) != frame_buffer.end()) {
+            FrameData& ordered_frame = frame_buffer[expected_index];
+            cv::Mat& frame = ordered_frame.frame;
+
+            // 绘制掩码和轨迹线（保持原有逻辑）
+            if (ordered_frame.od_results.count >= 1 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
+                uint8_t* seg_mask = ordered_frame.od_results.results_seg[0].seg_mask;
+                float alpha = 0.5f;
+                int mask_pixel_count = 0;
+                for (int j = 0; j < height; j++) {
+                    for (int k = 0; k < width; k++) {
+                        int idx = j * width + k;
+                        if (seg_mask[idx] != 0) {
+                            mask_pixel_count++;
+                            int cls_idx = seg_mask[idx] % 20;
+                            uchar* pixel = frame.ptr<uchar>(j, k);
+                            pixel[2] = (uchar)(class_colors[cls_idx][0] * (1 - alpha) + pixel[2] * alpha); // R
+                            pixel[1] = (uchar)(class_colors[cls_idx][1] * (1 - alpha) + pixel[1] * alpha); // G
+                            pixel[0] = (uchar)(class_colors[cls_idx][2] * (1 - alpha) + pixel[0] * alpha); // B
+                        }
+                    }
+                }
+                printf("Frame %d: Mask pixel count: %d\n", ordered_frame.frame_index, mask_pixel_count);
+
+                if (mask_pixel_count >= 100) {
+                    std::vector<cv::Point> left_track, right_track, middle_track;
+                    for (int y = 0; y < height; y++) {
+                        int left_x = -1, right_x = -1;
+                        for (int x = 0; x < width; x++) {
+                            int idx = y * width + x;
+                            if (seg_mask[idx] != 0) {
+                                if (left_x == -1) left_x = x;
+                                right_x = x;
+                            }
+                        }
+                        if (left_x != -1 && right_x != -1) {
+                            left_track.emplace_back(left_x, y);
+                            right_track.emplace_back(right_x, y);
+                            middle_track.emplace_back((left_x + right_x) / 2, y);
+                        }
+                    }
+
+                    printf("Frame %d: Left track: %zu, Right track: %zu, Middle track: %zu\n",
+                           ordered_frame.frame_index, left_track.size(), right_track.size(), middle_track.size());
+
+                    if (left_track.size() >= 2 && right_track.size() >= 2) {
+                        // 平滑轨迹线（保持原有高斯滤波）
+                        auto smooth_track = [](std::vector<cv::Point>& track) {
+                            if (track.size() < 2) return;
+                            std::vector<float> x_coords(track.size()), y_coords(track.size());
+                            for (size_t i = 0; i < track.size(); i++) {
+                                x_coords[i] = static_cast<float>(track[i].x);
+                                y_coords[i] = static_cast<float>(track[i].y);
+                            }
+                            cv::Mat x_mat(x_coords, true), y_mat(y_coords, true);
+                            cv::GaussianBlur(x_mat, x_mat, cv::Size(9, 1), 2.0, 0, cv::BORDER_REFLECT);
+                            cv::GaussianBlur(y_mat, y_mat, cv::Size(9, 1), 2.0, 0, cv::BORDER_REFLECT);
+                            for (size_t i = 0; i < track.size(); i++) {
+                                track[i] = cv::Point(static_cast<int>(x_mat.at<float>(i)), static_cast<int>(y_mat.at<float>(i)));
+                            }
+                        };
+
+                        smooth_track(left_track);
+                        smooth_track(right_track);
+                        smooth_track(middle_track);
+
+                        // 帧间平滑（保持原有逻辑）
+                        if (!left_track_history.empty() && !right_track_history.empty() && !middle_track_history.empty()) {
+                            size_t target_size = left_track.size();
+                            std::vector<cv::Point> smoothed_left_track(target_size), smoothed_right_track(target_size), smoothed_middle_track(target_size);
+
+                            for (size_t i = 0; i < target_size; i++) {
+                                float avg_left_x = 0, avg_left_y = 0;
+                                float avg_right_x = 0, avg_right_y = 0;
+                                float avg_middle_x = 0, avg_middle_y = 0;
+                                float total_weight = 0;
+                                float current_weight = ALPHA;
+
+                                avg_left_x += current_weight * left_track[i].x;
+                                avg_left_y += current_weight * left_track[i].y;
+                                avg_right_x += current_weight * right_track[i].x;
+                                avg_right_y += current_weight * right_track[i].y;
+                                avg_middle_x += current_weight * middle_track[i].x;
+                                avg_middle_y += current_weight * middle_track[i].y;
+                                total_weight += current_weight;
+
+                                float history_weight = (1.0f - ALPHA) / left_track_history.size();
+                                for (size_t j = 0; j < left_track_history.size(); j++) {
+                                    const auto& hist_left = left_track_history[j];
+                                    const auto& hist_right = right_track_history[j];
+                                    const auto& hist_middle = middle_track_history[j];
+                                    if (!hist_left.empty()) {
+                                        size_t hist_size = hist_left.size();
+                                        size_t hist_idx = static_cast<size_t>((static_cast<float>(i) / target_size) * hist_size);
+                                        hist_idx = std::min(hist_idx, hist_size - 1);
+
+                                        avg_left_x += history_weight * hist_left[hist_idx].x;
+                                        avg_left_y += history_weight * hist_left[hist_idx].y;
+                                        avg_right_x += history_weight * hist_right[hist_idx].x;
+                                        avg_right_y += history_weight * hist_right[hist_idx].y;
+                                        avg_middle_x += history_weight * hist_middle[hist_idx].x;
+                                        avg_middle_y += history_weight * hist_middle[hist_idx].y;
+                                        total_weight += history_weight;
+                                    }
+                                }
+
+                                smoothed_left_track[i] = cv::Point(static_cast<int>(avg_left_x / total_weight),
+                                                                  static_cast<int>(avg_left_y / total_weight));
+                                smoothed_right_track[i] = cv::Point(static_cast<int>(avg_right_x / total_weight),
+                                                                   static_cast<int>(avg_right_y / total_weight));
+                                smoothed_middle_track[i] = cv::Point(static_cast<int>(avg_middle_x / total_weight),
+                                                                    static_cast<int>(avg_middle_y / total_weight));
+                            }
+
+                            left_track = smoothed_left_track;
+                            right_track = smoothed_right_track;
+                            middle_track = smoothed_middle_track;
+                        }
+
+                        // 更新历史轨迹（保持原有逻辑）
+                        left_track_history.push_back(left_track);
+                        right_track_history.push_back(right_track);
+                        middle_track_history.push_back(middle_track);
+                        if (left_track_history.size() > HISTORY_SIZE) {
+                            left_track_history.pop_front();
+                            right_track_history.pop_front();
+                            middle_track_history.pop_front();
+                        }
+
+                        #if GPIO_CONTROL
+                        // 计算小车动态位置（图像下半部分1/2处，两个蓝色轨迹线的中间点）
+                        int car_y = height * 3 / 4; // 图像下半部分1/2处
+                        int car_x = width / 2;      // 默认值，稍后动态调整
+                        cv::Point car_position(car_x, car_y);
+
+                        // 在left_track和right_track中找到y最接近car_y的点
+                        int left_x = -1, right_x = -1;
+                        int min_y_diff = height; // 初始化为最大值
+                        for (size_t i = 0; i < left_track.size() && i < right_track.size(); i++) {
+                            int y_diff = std::abs(left_track[i].y - car_y);
+                            if (y_diff < min_y_diff) {
+                                min_y_diff = y_diff;
+                                left_x = left_track[i].x;
+                                right_x = right_track[i].x;
+                            }
+                        }
+                        if (left_x != -1 && right_x != -1) {
+                            car_x = (left_x + right_x) / 2; // 动态计算x坐标
+                            car_position = cv::Point(car_x, car_y);
+                        }
+
+                        // 选择前视点（基于小车位置选择较远距离）
+                        cv::Point lookahead_point = cv::Point(car_x, car_y); // 默认值
+                        int lookahead_distance = 430; // 前视距离（像素，增加到300）
+                        int target_y = car_y - lookahead_distance; // 目标y坐标
+                        bool found_lookahead = false;
+                        int closest_idx = -1;
+                        int min_distance = INT_MAX;
+
+                        // 找到距离target_y最近的点
+                        for (size_t i = 0; i < middle_track.size(); i++) {
+                            int distance = std::abs(middle_track[i].y - target_y);
+                            if (distance < min_distance) {
+                                min_distance = distance;
+                                closest_idx = i;
+                            }
+                            if (middle_track[i].y <= car_y && middle_track[i].y >= target_y) {
+                                lookahead_point = middle_track[i];
+                                found_lookahead = true;
+                                break;
+                            }
+                        }
+                        if (!found_lookahead && closest_idx != -1) {
+                            lookahead_point = middle_track[closest_idx];
+                            found_lookahead = true;
+                        }
+
+                        // 调试输出前视点位置和middle_track的y范围
+                        int min_y = height, max_y = 0;
+                        for (const auto& point : middle_track) {
+                            if (point.y < min_y) min_y = point.y;
+                            if (point.y > max_y) max_y = point.y;
+                        }
+                        // printf("Frame %d: Car at (%d, %d), Lookahead at (%d, %d), Found: %d, Middle track y-range: [%d, %d]\n",
+                        //        ordered_frame.frame_index, car_x, car_y, lookahead_point.x, lookahead_point.y, found_lookahead, min_y, max_y);
+
+                        // 计算偏移角度
+                        float dx = lookahead_point.x - car_x;
+                        float dy = car_y - lookahead_point.y; // 注意坐标系方向
+                        float steering_angle = std::atan2(dx, dy); // 弧度
+                        float steering_angle_deg = steering_angle * 180.0f / CV_PI; // 转换为度数
+
+                        // 根据偏移角度控制方向（保留原有阈值逻辑）
+                        const int TURN_THRESHOLD = 50;
+                        int offset = lookahead_point.x - car_x;
+
+                        if (offset > TURN_THRESHOLD) {
+                            setGPIO(gpio_left_fd, false);
+                            setGPIO(gpio_right_fd, true);
+                            cv::putText(frame, "Turn Right", cv::Point(20, 40),
+                                       cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+                            printf("Frame %d: Turn Right, angle: %.2f deg\n", ordered_frame.frame_index, steering_angle_deg);
+                        }
+                        else if (offset < -TURN_THRESHOLD) {
+                            setGPIO(gpio_left_fd, true);
+                            setGPIO(gpio_right_fd, false);
+                            cv::putText(frame, "Turn Left", cv::Point(20, 40),
+                                       cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+                            printf("Frame %d: Turn Left, angle: %.2f deg\n", ordered_frame.frame_index, steering_angle_deg);
+                        }
+                        else {
+                            setGPIO(gpio_left_fd, false);
+                            setGPIO(gpio_right_fd, false);
+                            cv::putText(frame, "Straight", cv::Point(20, 40),
+                                       cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+                            printf("Frame %d: Go Straight, angle: %.2f deg\n", ordered_frame.frame_index, steering_angle_deg);
+                        }
+
+                        // 绘制轨迹线（先绘制轨迹线）
+                        for (size_t i = 1; i < left_track.size(); i++) {
+                            cv::line(frame, left_track[i - 1], left_track[i], cv::Scalar(255, 0, 0), 2);
+                            cv::line(frame, right_track[i - 1], right_track[i], cv::Scalar(255, 0, 0), 2);
+                            cv::line(frame, middle_track[i - 1], middle_track[i], cv::Scalar(255, 255, 255), 2);
+                        }
+
+                        // 绘制小车位置（红色三角形）
+                        std::vector<cv::Point> car_icon;
+                        car_icon.push_back(cv::Point(car_x, car_y - 10));       // 上顶点
+                        car_icon.push_back(cv::Point(car_x - 10, car_y + 10));  // 左下角
+                        car_icon.push_back(cv::Point(car_x + 10, car_y + 10));  // 右下角
+                        cv::fillPoly(frame, std::vector<std::vector<cv::Point>>{car_icon}, cv::Scalar(0, 0, 255));
+
+                        // 绘制前视点（圆圈内带十字）
+                        cv::circle(frame, lookahead_point, 10, cv::Scalar(0, 255, 0), 2); // 绿色外圈
+                        cv::line(frame, cv::Point(lookahead_point.x - 7, lookahead_point.y), 
+                                 cv::Point(lookahead_point.x + 7, lookahead_point.y), cv::Scalar(0, 255, 0), 2); // 横线
+                        cv::line(frame, cv::Point(lookahead_point.x, lookahead_point.y - 7), 
+                                 cv::Point(lookahead_point.x, lookahead_point.y + 7), cv::Scalar(0, 255, 0), 2); // 竖线
+
+                        // 绘制科幻风格偏移角度示意图（右边中间，透明效果）
+                        int indicator_x = width - 80; // 右边，距离边缘80像素
+                        int indicator_y = height / 2; // 中间高度
+                        cv::Point indicator_center(indicator_x, indicator_y);
+
+                        // 创建透明叠加层
+                        cv::Mat overlay = frame.clone();
+                        cv::circle(overlay, indicator_center, 40, cv::Scalar(255, 100, 0), -1, cv::LINE_AA); // 深蓝色填充
+                        cv::circle(overlay, indicator_center, 40, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);  // 黄色外圈
+                        cv::circle(overlay, indicator_center, 45, cv::Scalar(255, 255, 0, 100), 2, cv::LINE_AA); // 光晕
+
+                        // 融合透明效果
+                        double alpha_overlay = 0.3; // 透明度（0.0完全透明，1.0完全不透明）
+                        cv::addWeighted(overlay, alpha_overlay, frame, 1.0 - alpha_overlay, 0.0, frame);
+
+                        // 绘制指针（线加箭头）
+                        float angle_rad = steering_angle;
+                        int pointer_length = 35;
+                        int end_x = indicator_x + static_cast<int>(pointer_length * std::sin(angle_rad));
+                        int end_y = indicator_y - static_cast<int>(pointer_length * std::cos(angle_rad));
+                        cv::line(frame, indicator_center, cv::Point(end_x, end_y), cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+
+                        // 绘制箭头
+                        float arrow_angle = 0.5f; // 箭头张开角度（弧度）
+                        int arrow_length = 10;
+                        int arrow_x1 = end_x - static_cast<int>(arrow_length * std::sin(angle_rad - arrow_angle));
+                        int arrow_y1 = end_y + static_cast<int>(arrow_length * std::cos(angle_rad - arrow_angle));
+                        int arrow_x2 = end_x - static_cast<int>(arrow_length * std::sin(angle_rad + arrow_angle));
+                        int arrow_y2 = end_y + static_cast<int>(arrow_length * std::cos(angle_rad + arrow_angle));
+                        cv::line(frame, cv::Point(end_x, end_y), cv::Point(arrow_x1, arrow_y1), cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+                        cv::line(frame, cv::Point(end_x, end_y), cv::Point(arrow_x2, arrow_y2), cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+
+                        // 标注角度值（使用"deg"替代"°"）
+                        char angle_text[32];
+                        snprintf(angle_text, sizeof(angle_text), "%.1f deg", steering_angle_deg);
+                        cv::putText(frame, angle_text, cv::Point(indicator_x - 20, indicator_y + 50),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 2, cv::LINE_AA); // 阴影
+                        cv::putText(frame, angle_text, cv::Point(indicator_x - 20, indicator_y + 50),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 1, cv::LINE_AA); // 文字
+                        #endif
+                    } else {
+                        printf("Frame %d: Too few track points, clearing history and skipping track drawing\n", ordered_frame.frame_index);
+                        left_track_history.clear();
+                        right_track_history.clear();
+                        middle_track_history.clear();
+                    }
+                } else {
+                    printf("Frame %d: Too few mask pixels, clearing history and skipping track drawing\n", ordered_frame.frame_index);
+                    left_track_history.clear();
+                    right_track_history.clear();
+                    middle_track_history.clear();
+                }
+            } else {
+                printf("Frame %d: No valid mask data, clearing history\n", ordered_frame.frame_index);
+                left_track_history.clear();
+                right_track_history.clear();
+                middle_track_history.clear();
+            }
+
+            // 绘制边界框和标签（保持原有逻辑）
+            #if 0
+            for (int i = 0; i < ordered_frame.od_results.count; i++) {
+                object_detect_result* det_result = &ordered_frame.od_results.results[i];
+                int x1 = det_result->box.left;
+                int y1 = det_result->box.top;
+                int x2 = det_result->box.right;
+                int y2 = det_result->box.bottom;
+                int cls_id = det_result->cls_id;
+
+                cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 0, 255), 3);
+                char text[256];
+                snprintf(text, sizeof(text), "%s %.1f%%", coco_cls_to_name(cls_id), det_result->prop * 100);
+                cv::putText(frame, text, cv::Point(x1, y1 - 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+            }
+            #endif
+            // 保存视频（保持原有逻辑）
+            // writer.write(frame);
+            frame_count++;
+
+            #if ENABLE_TCP_SENDER
+            processed_queue.push(FrameData(frame, ordered_frame.frame_index, ordered_frame.od_results));
+            #endif
+
+            // 释放掩码内存（保持原有逻辑）
+            if (ordered_frame.od_results.count > 0 && ordered_frame.od_results.results_seg[0].seg_mask != nullptr) {
+                free(ordered_frame.od_results.results_seg[0].seg_mask);
+                ordered_frame.od_results.results_seg[0].seg_mask = nullptr;
+            }
+
+            frame_buffer.erase(expected_index);
+            expected_index++;
+        }
+
+        if (end_signal_received && frame_buffer.empty()) {
+            break;
+        }
+    }
+
+    #if GPIO_CONTROL
+        cleanupGPIO();
+    #endif
+    writer.release();
+    printf("Video saved as '%s' with %d frames\n", filename, frame_count);
+}
+
 
 #if 0
 void saveThread(const std::string& video_source) {
@@ -1509,11 +2376,11 @@ int main(int argc, char **argv) {
     setThreadAffinity(save_thread, 7);
     save_thread.detach();
 
-#if ENABLE_TCP_SENDER
-    std::thread tcp_thread(tcpSenderThread);
-    setThreadAffinity(tcp_thread, 0);
-    tcp_thread.detach();
-#endif
+    #if ENABLE_TCP_SENDER
+        std::thread tcp_thread(tcpSenderThread);
+        setThreadAffinity(tcp_thread, 0);
+        tcp_thread.detach();
+    #endif
 
     printf("Press 'q' and Enter to quit...\n");
     char input;
